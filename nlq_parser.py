@@ -16,15 +16,27 @@ class OpenSearchQueryBuilder:
     
     TIMESTAMP_FIELD = "@timestamp"
     
+    # Static field mapping for standardized query terms
+    FIELD_MAPPING = {
+        "service": "tags",
+        "serviceName": "tags", 
+        "service_name": "tags",
+        "level": "fields.level",
+        "logLevel": "fields.level",
+        "log_level": "fields.level",
+        "message": "message",
+        "timestamp": "@timestamp",
+        "index": "_index"
+    }
+    
     def __init__(self):
         self.default_size = 50
         self.default_sort = [{self.TIMESTAMP_FIELD: "desc"}]
         
     def build_base_query(self, size: Optional[int] = None) -> Dict[str, Any]:
-        """Build base query structure with defaults."""
+        """Build simple base query structure - no sorting to avoid field mapping issues."""
         return {
-            "size": size if size is not None else self.default_size,
-            "sort": self.default_sort
+            "size": size if size is not None else self.default_size
         }
     
     def build_bool_query(self, must: List[Dict] = None, should: List[Dict] = None, 
@@ -90,19 +102,64 @@ class OpenSearchQueryBuilder:
         
         return None
     
+    def get_mapped_field(self, field_name: str) -> str:
+        """Get the actual Elasticsearch field name from standardized term."""
+        return self.FIELD_MAPPING.get(field_name.lower(), field_name)
+    
+    def build_term_filter(self, field_name: str, value: str) -> Dict[str, Any]:
+        """Build term filter using field mapping for standardized queries."""
+        mapped_field = self.get_mapped_field(field_name)
+        
+        # Apply value transformation based on field type
+        if mapped_field == "fields.level":
+            # Log levels should be uppercase
+            value = value.upper()
+        elif mapped_field == "tags":
+            # Service names should be lowercase
+            value = value.lower()
+        
+        return {"term": {mapped_field: value}}
+    
     def build_service_filter(self, service_name: str) -> Dict[str, Any]:
-        """Build service name filter."""
-        return {"match": {"service.name": service_name}}
+        """Build service name filter using field mapping."""
+        return self.build_term_filter("service", service_name)
     
     def build_log_level_filter(self, level: str) -> Dict[str, Any]:
-        """Build log level filter."""
-        return {"match": {"log.level": level.lower()}}
+        """Build log level filter using field mapping."""
+        return self.build_term_filter("level", level)
     
     def build_text_search(self, text: str, field: str = "_all") -> Dict[str, Any]:
-        """Build text search query."""
+        """Build text search query using field mapping if applicable."""
+        if field != "_all":
+            field = self.get_mapped_field(field)
+        
         if field == "_all":
             return {"match": {"_all": text}}
         return {"match": {field: text}}
+    
+    def get_supported_fields(self) -> List[str]:
+        """Get list of supported standardized field names."""
+        return list(self.FIELD_MAPPING.keys())
+    
+    def build_generic_filter(self, field_name: str, value: str, query_type: str = "term") -> Dict[str, Any]:
+        """Build generic filter using field mapping."""
+        mapped_field = self.get_mapped_field(field_name)
+        
+        # Apply value transformation based on field type
+        if mapped_field == "fields.level":
+            value = value.upper()
+        elif mapped_field == "tags":
+            value = value.lower()
+        
+        if query_type == "term":
+            return {"term": {mapped_field: value}}
+        elif query_type == "match":
+            return {"match": {mapped_field: value}}
+        elif query_type == "match_phrase":
+            return {"match_phrase": {mapped_field: value}}
+        
+        # Default to term query
+        return {"term": {mapped_field: value}}
 
 
 class NLQParser:
@@ -129,6 +186,67 @@ class NLQParser:
             # Disable logging completely
             self.logger.setLevel(logging.CRITICAL + 1)
             self.logger.propagate = False
+    
+    def get_supported_fields(self) -> List[str]:
+        """Get list of supported standardized field names."""
+        return self.query_builder.get_supported_fields()
+    
+    def validate_field_names(self, query: str) -> List[str]:
+        """Validate field names in query and return any unsupported fields."""
+        supported_fields = set(self.get_supported_fields())
+        unsupported = []
+        
+        # Look for field:value patterns - including dotted field names
+        field_patterns = [
+            r"([\w\.]+)\s*:\s*\w+",  # field:value (including dotted like fields.level)
+            r"([\w\.]+)\s*=\s*\w+",  # field=value
+            r"([\w\.]+)\s+is\s+\w+", # field is value
+            r"([\w\.]+)\s+equals\s+\w+" # field equals value
+        ]
+        
+        for pattern in field_patterns:
+            matches = re.findall(pattern, query.lower())
+            for field in matches:
+                # Split dotted fields and check each part
+                if '.' in field:
+                    # For dotted fields like "fields.level", check if it's a deprecated ES field name
+                    if field in ["fields.level", "host.name", "tags"]:
+                        unsupported.append(field)
+                elif field not in supported_fields and field not in ["last", "show", "limit", "top", "first"]:
+                    unsupported.append(field)
+        
+        return list(set(unsupported))
+    
+    def extract_field_value_pairs(self, query: str) -> List[tuple]:
+        """Extract field-value pairs from natural language query."""
+        pairs = []
+        query_lower = query.lower()
+        
+        # Pattern: field:value or field=value
+        direct_patterns = [
+            r"(\w+)\s*:\s*([^\s,]+)",
+            r"(\w+)\s*=\s*([^\s,]+)"
+        ]
+        
+        for pattern in direct_patterns:
+            matches = re.findall(pattern, query_lower)
+            for field, value in matches:
+                if field in self.get_supported_fields():
+                    pairs.append((field, value))
+        
+        # Pattern: field is value, field equals value
+        is_equals_patterns = [
+            r"(\w+)\s+is\s+([^\s,]+)",
+            r"(\w+)\s+equals?\s+([^\s,]+)"
+        ]
+        
+        for pattern in is_equals_patterns:
+            matches = re.findall(pattern, query_lower)
+            for field, value in matches:
+                if field in self.get_supported_fields():
+                    pairs.append((field, value))
+        
+        return pairs
         
     def parse(self, natural_query: str) -> str:
         """
@@ -156,7 +274,17 @@ class NLQParser:
         """Parse natural language to query dictionary."""
         query = natural_query.lower().strip()
         
-        # Check for unsupported operations first
+        # Validate field names first
+        unsupported_fields = self.validate_field_names(query)
+        if unsupported_fields:
+            self.logger.warning(f"Unsupported field names found: {unsupported_fields}")
+            supported_fields = ', '.join(self.get_supported_fields())
+            return {
+                "error": f"Unsupported field names: {', '.join(unsupported_fields)}. "
+                        f"Supported fields: {supported_fields}"
+            }
+        
+        # Check for unsupported operations
         if self._is_unsupported_query(query):
             self.logger.debug("Query identified as unsupported operation")
             return {"error": "Unsupported query. Please rephrase or check available APIs."}
@@ -173,17 +301,26 @@ class NLQParser:
             self.logger.debug("Query identified as cat API request")
             return self._handle_cat_query(query)
         
-        # Parse log level
-        log_level = self._extract_log_level(query)
-        if log_level:
-            self.logger.debug(f"Extracted log level: {log_level}")
-            must_clauses.append(self.query_builder.build_log_level_filter(log_level))
+        # Extract field-value pairs from standardized syntax (e.g., service:hydra, level:error)
+        field_value_pairs = self.extract_field_value_pairs(query)
+        if field_value_pairs:
+            self.logger.debug(f"Extracted field-value pairs: {field_value_pairs}")
+            for field, value in field_value_pairs:
+                must_clauses.append(self.query_builder.build_generic_filter(field, value))
         
-        # Parse service name
-        service_name = self._extract_service_name(query)
-        if service_name:
-            self.logger.debug(f"Extracted service name: {service_name}")
-            must_clauses.append(self.query_builder.build_service_filter(service_name))
+        # Fallback to legacy parsing for backward compatibility
+        if not field_value_pairs:
+            # Parse log level
+            log_level = self._extract_log_level(query)
+            if log_level:
+                self.logger.debug(f"Extracted log level: {log_level}")
+                must_clauses.append(self.query_builder.build_log_level_filter(log_level))
+            
+            # Parse service name
+            service_name = self._extract_service_name(query)
+            if service_name:
+                self.logger.debug(f"Extracted service name: {service_name}")
+                must_clauses.append(self.query_builder.build_service_filter(service_name))
         
         # Parse time range
         time_filter = self._extract_time_range(query)
@@ -191,12 +328,18 @@ class NLQParser:
             self.logger.debug(f"Extracted time filter: {time_filter}")
             must_clauses.append(time_filter)
         
-        # Parse text search
+        # Parse text search (exclude already processed field-value pairs and service names)
         search_terms = self._extract_search_terms(query)
-        if search_terms:
-            self.logger.debug(f"Extracted search terms: {search_terms}")
-            for term in search_terms:
-                must_clauses.append(self.query_builder.build_text_search(term))
+        if search_terms and not field_value_pairs:
+            # Filter out service names from search terms to avoid redundancy
+            service_name = self._extract_service_name(query)
+            if service_name:
+                search_terms = [term for term in search_terms if term.lower() != service_name.lower()]
+            
+            if search_terms:
+                self.logger.debug(f"Extracted search terms: {search_terms}")
+                for term in search_terms:
+                    must_clauses.append(self.query_builder.build_text_search(term))
         
         # Parse size if specified
         size = self._extract_size(query)
@@ -286,30 +429,43 @@ class NLQParser:
     
     def _extract_log_level(self, query: str) -> Optional[str]:
         """Extract log level from query."""
-        levels = ["error", "errors", "warn", "warning", "warnings", "info", "debug", "trace"]
-        for level in levels:
-            if level in query:
+        # Extended patterns to handle "loglevel error", "log level error", "level error", etc.
+        level_patterns = [
+            r"(?:log\s*level|loglevel|level)\s+(error|errors|warn|warning|warnings|info|debug|trace)",
+            r"\b(error|errors|warn|warning|warnings|info|debug|trace)\b"
+        ]
+        
+        for pattern in level_patterns:
+            matches = re.findall(pattern, query.lower())
+            for level in matches:
                 if level == "errors":
                     return "error"
                 elif level in ["warn", "warning", "warnings"]:
                     return "warn"
                 return level
+        
         return None
     
     def _extract_service_name(self, query: str) -> Optional[str]:
         """Extract service name from query."""
         # Pattern for "service-name" or "for service-name" or "in service-name"
+        # Order matters - more specific patterns first!
         patterns = [
-            r"for\s+([a-zA-Z0-9\-_]+)[-\s]*service",
-            r"in\s+([a-zA-Z0-9\-_]+)[-\s]*service", 
-            r"([a-zA-Z0-9\-_]+)[-\s]*service",
-            r"service\s+([a-zA-Z0-9\-_]+)"
+            r"service\s+([a-zA-Z0-9\-_]+)",                # "service hydra" - most specific first
+            r"for\s+([a-zA-Z0-9\-_]+)[-\s]*service",       # "for hydra-service"
+            r"in\s+([a-zA-Z0-9\-_]+)[-\s]*service",        # "in hydra-service"
+            r"for\s+([a-zA-Z0-9\-_]+)(?!\s*service)",      # "for hydra" without "service"
+            r"in\s+([a-zA-Z0-9\-_]+)(?!\s*service)",       # "in hydra" without "service"
+            r"([a-zA-Z0-9\-_]+)[-\s]*service",             # "hydra-service" - most general last
         ]
         
         for pattern in patterns:
-            match = re.search(pattern, query)
+            match = re.search(pattern, query.lower())
             if match:
                 service_name = match.group(1)
+                # Skip generic words that aren't actually service names
+                if service_name in ["all", "the", "any", "some", "logs", "log", "show", "get", "find"]:
+                    continue
                 # If the service name ends with a hyphen, add "service"
                 if service_name.endswith('-'):
                     return service_name + "service"
@@ -332,7 +488,9 @@ class NLQParser:
             "cluster", "health", "status", "list", "nodes", "indices", "shards", "top",
             "results", "limit", "first", "today", "yesterday", "complex", "unsupported", 
             "that", "should", "fail", "query", "api", "to", "a", "an", "is", "are", "was",
-            "were", "be", "been", "being", "have", "has", "had", "do", "does", "did"
+            "were", "be", "been", "being", "have", "has", "had", "do", "does", "did",
+            "all", "any", "some", "give", "gives", "data", "entries", "records",
+            "level", "loglevel", "logLevel", "log_level"  # Added log level related terms
         }
         
         # Remove service names and time expressions from search
@@ -356,8 +514,13 @@ class NLQParser:
         for pattern in time_patterns:
             temp_query = re.sub(pattern, '', temp_query)
         
-        # Remove log level words
-        temp_query = re.sub(r'\b(error|errors|warn|warning|warnings|info|debug|trace)\b', '', temp_query)
+        # Remove log level patterns - including "loglevel error", "log level error", etc.
+        log_level_patterns = [
+            r'(?:log\s*level|loglevel|level)\s+(error|errors|warn|warning|warnings|info|debug|trace)',
+            r'\b(error|errors|warn|warning|warnings|info|debug|trace)\b'
+        ]
+        for pattern in log_level_patterns:
+            temp_query = re.sub(pattern, '', temp_query)
         
         # Split query and filter out stop words
         words = re.findall(r'\b[a-zA-Z]+\b', temp_query)
@@ -389,7 +552,7 @@ class NLQParser:
         return None
 
 
-def configure_logging(level=logging.INFO, enable_debug=False):
+def configure_logging(level=logging.INFO, enable_debug=True):
     """Configure global logging level for debug information."""
     if enable_debug:
         level = logging.DEBUG
@@ -408,7 +571,17 @@ def main():
     parser = NLQParser(enable_logging=True)
     
     print("OpenSearch Natural Language Query Parser")
-    print("Enter 'quit' or 'exit' to stop")
+    print("=" * 50)
+    print("📋 SUPPORTED FIELD MAPPINGS:")
+    for std_field, es_field in parser.query_builder.FIELD_MAPPING.items():
+        print(f"   {std_field} → {es_field}")
+    
+    print("\n💡 EXAMPLE QUERIES:")
+    print('   • "service:hydra level:error last 5 minutes"')
+    print('   • "level=INFO service=api-gateway"')
+    print('   • "service is hydra and level is error"')
+    print('   • "errors in last 5 minutes for Hydra" (legacy syntax)')
+    print("\nEnter 'quit' or 'exit' to stop")
     print("Note: Logging is enabled to show query processing details\n")
     
     while True:
